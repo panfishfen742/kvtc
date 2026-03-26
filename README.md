@@ -27,15 +27,18 @@ KV caches grow linearly with context length and can consume multiple gigabytes f
 | H2O | 4–8× | Task-dependent | Token eviction |
 | xKV | 8–16× | Strong | SVD-based compression |
 
-### Our Results (Mistral-7B-Instruct-v0.3, 4-bit quantized)
+### Our Results — TinyLlama-1.1B (22 layers × 4 heads × dim=64, 513 tokens)
 
-| Mode | Key Cosine | Value Cosine | Compression | Use Case |
-|------|:----------:|:------------:|:-----------:|----------|
-| High Quality | **0.9996** | **0.9982** | **7.9×** | Production serving |
-| Balanced | **0.9950** | **0.9818** | **16.2×** | Memory-constrained |
-| Aggressive | **0.9895** | **0.9654** | **31.7×** | Maximum compression |
+| Bit Budget | Bits/Value | Middle Compression | Key Cosine | Value Cosine | Use Case |
+|:----------:|:----------:|:------------------:|:----------:|:------------:|----------|
+| 0.50 | 8.0 | **4.0×** | **0.969** | **0.971** | High quality |
+| 0.35 | 5.6 | **5.8×** | **0.953** | **0.960** | Balanced |
+| 0.25 | 4.0 | **8.2×** | **0.899** | **0.899** | Max compression |
 
-Tested on 32 layers × 8 KV heads × head_dim=128. Attention sinks (first 4 tokens) and sliding window (last 128 tokens) preserved exactly — only middle tokens are compressed.
+Overall compression (including FP16 sinks + window): 1.9–3.4×. Middle-section compression: 4–8×.
+Sinks (4 tokens) and sliding window (32 tokens) preserved exactly in FP16.
+
+> GPU benchmarks on RTX 5090 coming soon. CPU compress time: ~6.4s for 513 tokens.
 
 ## Architecture
 
@@ -110,21 +113,21 @@ print(f"Compression ratio: {compressed.metadata.compression_ratio:.1f}x")
 restored = compressor.decompress(compressed)
 ```
 
-### Compression Modes
+### Compression Modes (measured on TinyLlama-1.1B, 513 tokens)
 
-| `bit_budget_ratio` | Compression | Quality | When to use |
-|:-------------------:|:-----------:|:-------:|-------------|
-| `0.25` | ~8× | Excellent (0.999+ cosine) | Production, quality-critical |
-| `0.12` | ~16× | Very good (0.995 cosine) | Balanced memory/quality |
-| `0.06` | ~32× | Good (0.989 cosine) | Maximum savings, long context |
+| `bit_budget_ratio` | Avg Bits | Middle Compression | Quality | When to use |
+|:-------------------:|:--------:|:------------------:|:-------:|-------------|
+| `0.50` | 8.0 | 4.0× | 0.97 cosine | Production, quality-critical |
+| `0.35` | 5.6 | 5.8× | 0.95 cosine | Balanced memory/quality |
+| `0.25` | 4.0 | 8.2× | 0.90 cosine | Maximum compression |
 
 ## Limitations
 
 - **Reference implementation** — Pure PyTorch on CPU. Not optimized for production throughput.
 - **Entropy coding is CPU-only** — Uses `zlib` DEFLATE. The paper uses NVIDIA's `nvCOMP` for GPU-accelerated DEFLATE.
 - **DP quantization is O(d × B × 16)** — Fast enough for reference use, but production would need optimized kernels.
-- **Compression is slow (~30-60s per prompt on CPU)** — The DP + PCA transform dominates. GPU acceleration would fix this.
-- **Tested on 2 models** — TinyLlama-1.1B and Mistral-7B. More model validation welcome.
+- **Compression is slow (~6s per prompt on CPU)** — The DP + PCA transform dominates. GPU acceleration would bring this under 100ms.
+- **Tested on TinyLlama-1.1B** — More model validation (Mistral-7B, Nemotron-Nano-4B) in progress.
 - **Not affiliated with NVIDIA** — Independent implementation from the public paper.
 
 ## Algorithm Details
