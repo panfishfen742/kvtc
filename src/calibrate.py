@@ -40,15 +40,29 @@ class KVTCCalibrator:
             with torch.no_grad():
                 outputs = model(**encoded, use_cache=True)
             positions = torch.arange(encoded["input_ids"].shape[1], device=device)
-            for layer_idx, (keys, values) in enumerate(outputs.past_key_values):
-                self._pca.collect(layer_idx, "keys", keys[0].transpose(0, 1).detach().cpu(), positions.cpu())
-                self._pca.collect(layer_idx, "values", values[0].transpose(0, 1).detach().cpu())
+            past = outputs.past_key_values
+            # Handle DynamicCache (.layers), legacy DynamicCache (.key_cache), and tuple formats
+            if hasattr(past, 'layers'):
+                # Newest transformers DynamicCache with .layers[i].keys/.values
+                for layer_idx, layer in enumerate(past.layers):
+                    self._pca.collect(layer_idx, "keys", layer.keys[0].transpose(0, 1).detach().cpu(), positions.cpu())
+                    self._pca.collect(layer_idx, "values", layer.values[0].transpose(0, 1).detach().cpu())
+            elif hasattr(past, 'key_cache'):
+                # Older DynamicCache with .key_cache/.value_cache lists
+                for layer_idx in range(len(past.key_cache)):
+                    self._pca.collect(layer_idx, "keys", past.key_cache[layer_idx][0].transpose(0, 1).detach().cpu(), positions.cpu())
+                    self._pca.collect(layer_idx, "values", past.value_cache[layer_idx][0].transpose(0, 1).detach().cpu())
+            else:
+                # Legacy tuple-of-tuples format
+                for layer_idx, (keys, values) in enumerate(past):
+                    self._pca.collect(layer_idx, "keys", keys[0].transpose(0, 1).detach().cpu(), positions.cpu())
+                    self._pca.collect(layer_idx, "values", values[0].transpose(0, 1).detach().cpu())
             self.samples_collected += 1
 
-    def compute_calibration(self) -> CalibrationData:
+    def compute_calibration(self, bit_budget_ratio: float = 0.25) -> CalibrationData:
         """Compute the final calibration data."""
 
-        return self._pca.compute()
+        return self._pca.compute(bit_budget_ratio=bit_budget_ratio)
 
     def save(self, path: str | Path, calibration_data: CalibrationData) -> None:
         """Persist calibration data to disk."""

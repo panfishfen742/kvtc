@@ -43,9 +43,19 @@ def test_tinyllama_compression_metrics() -> None:
     with torch.no_grad():
         outputs = model(**encoded, use_cache=True)
     keys, values = [], []
-    for layer_keys, layer_values in outputs.past_key_values:
-        keys.append(layer_keys[0].transpose(0, 1))
-        values.append(layer_values[0].transpose(0, 1))
+    past = outputs.past_key_values
+    if hasattr(past, 'layers'):
+        for layer in past.layers:
+            keys.append(layer.keys[0].transpose(0, 1))
+            values.append(layer.values[0].transpose(0, 1))
+    elif hasattr(past, 'key_cache'):
+        for i in range(len(past.key_cache)):
+            keys.append(past.key_cache[i][0].transpose(0, 1))
+            values.append(past.value_cache[i][0].transpose(0, 1))
+    else:
+        for layer_keys, layer_values in past:
+            keys.append(layer_keys[0].transpose(0, 1))
+            values.append(layer_values[0].transpose(0, 1))
     kv_cache = {"keys": torch.stack(keys), "values": torch.stack(values)}
     positions = torch.arange(encoded["input_ids"].shape[1], dtype=torch.long)
     compressed = compressor.compress(kv_cache, positions)
