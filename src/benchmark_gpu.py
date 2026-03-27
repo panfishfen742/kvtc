@@ -79,11 +79,15 @@ def measure_compression(
     positions: torch.Tensor,
     calibration_data,
     verbose: bool = True,
+    use_fast: bool = True,
 ) -> Dict:
     """Compress, decompress, and measure quality metrics."""
-    from src.pipeline import KVTCCompressor
-    
-    compressor = KVTCCompressor(calibration_data)
+    if use_fast:
+        from src.pipeline_fast import KVTCCompressorFast
+        compressor = KVTCCompressorFast(calibration_data)
+    else:
+        from src.pipeline import KVTCCompressor
+        compressor = KVTCCompressor(calibration_data)
     
     # Compress
     t0 = time.perf_counter()
@@ -182,6 +186,9 @@ def measure_compression(
         print()
         print(f"Compress time:   {compress_time * 1000:.1f} ms")
         print(f"Decompress time: {decompress_time * 1000:.1f} ms")
+        if hasattr(compressor, 'timing') and compressor.timing:
+            t = compressor.timing
+            print(f"  Breakdown: PCA={t.get('pca_ms',0):.0f}ms  DP={t.get('dp_ms',0):.0f}ms  Quant={t.get('quant_ms',0):.0f}ms  Pack={t.get('pack_ms',0):.0f}ms")
         print("=" * 60)
     
     return results
