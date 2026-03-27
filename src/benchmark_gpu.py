@@ -189,6 +189,8 @@ def measure_compression(
         if hasattr(compressor, 'timing') and compressor.timing:
             t = compressor.timing
             print(f"  Breakdown: PCA={t.get('pca_ms',0):.0f}ms  DP={t.get('dp_ms',0):.0f}ms  Quant={t.get('quant_ms',0):.0f}ms  Pack={t.get('pack_ms',0):.0f}ms")
+            if 'avg_bits_allocated' in t:
+                print(f"  Avg bits actually allocated: {t['avg_bits_allocated']:.2f}")
         print("=" * 60)
     
     return results

@@ -106,6 +106,10 @@ class KVTCCompressorFast:
 
                         # Vectorized quantization
                         t0 = time.perf_counter()
+                        # Debug: track actual bit allocation
+                        if not hasattr(self, '_bit_stats'):
+                            self._bit_stats = []
+                        self._bit_stats.append(float(bit_widths.float().mean().item()))
                         params = vectorized_quant_params(pca_values, bit_widths)
                         indices = batch_quantize(
                             pca_values, bit_widths,
@@ -149,12 +153,14 @@ class KVTCCompressorFast:
             compression_ratio=ratio,
         )
 
+        avg_bits = sum(self._bit_stats) / len(self._bit_stats) if hasattr(self, '_bit_stats') and self._bit_stats else 0
         self._timing = {
             "pca_ms": t_pca * 1000,
             "dp_ms": t_dp * 1000,
             "quant_ms": t_quant * 1000,
             "pack_ms": t_pack * 1000,
             "total_ms": (time.perf_counter() - t_total) * 1000,
+            "avg_bits_allocated": avg_bits,
         }
 
         return CompressedKVCache(
