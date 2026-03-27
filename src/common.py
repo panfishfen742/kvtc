@@ -21,6 +21,11 @@ class PCAEntry:
     head_indices: List[int]
     kind: str
     bit_budget: int
+    pca_mins: torch.Tensor | None = None
+    pca_maxs: torch.Tensor | None = None
+    bit_widths: torch.Tensor | None = None
+    scales: torch.Tensor | None = None
+    zero_points: torch.Tensor | None = None
 
 
 @dataclass

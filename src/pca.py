@@ -8,6 +8,7 @@ from typing import DefaultDict, Dict, List, Tuple
 import torch
 
 from .common import CalibrationData, PCAEntry
+from .gpu_ops import greedy_bit_allocation, vectorized_quant_params
 
 
 def _validate_head_dim(head_dim: int) -> None:
@@ -123,16 +124,26 @@ class PCACalibrator:
             mean = matrix.mean(dim=0)
             centered = matrix - mean
             _, singular_values, vh = torch.linalg.svd(centered, full_matrices=False)
+            eigenvectors = vh.transpose(0, 1).contiguous()
             eigenvalues = (singular_values.square() / max(centered.shape[0] - 1, 1)).to(torch.float32)
             bit_budget = max(1, int(matrix.shape[-1] * 16 * bit_budget_ratio))
+            pca_values = pca_transform(centered, eigenvectors)
+            bit_widths = greedy_bit_allocation(eigenvalues, bit_budget)
+            params = vectorized_quant_params(pca_values, bit_widths)
+            pca_maxs = pca_values.max(dim=0).values.to(torch.float32)
             _, group_idx, kind = key
             head_start = group_idx * self.head_group_size
             entries[key] = PCAEntry(
-                eigenvectors=vh.transpose(0, 1).contiguous(),
+                eigenvectors=eigenvectors,
                 eigenvalues=eigenvalues.contiguous(),
                 mean=mean.contiguous(),
                 head_indices=list(range(head_start, head_start + self.head_group_size)),
                 kind=kind,
                 bit_budget=bit_budget,
+                pca_mins=params.mins.contiguous(),
+                pca_maxs=pca_maxs.contiguous(),
+                bit_widths=bit_widths.contiguous(),
+                scales=params.scales.contiguous(),
+                zero_points=params.zero_points.contiguous(),
             )
         return CalibrationData(entries=entries, head_group_size=self.head_group_size, rope_theta=self.rope_theta)

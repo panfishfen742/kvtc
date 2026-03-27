@@ -1,0 +1,765 @@
+"""Monkey-patch layer that routes vLLM attention through KVTC."""
+
+from __future__ import annotations
+
+import math
+import re
+import time
+import types
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Sequence
+
+import torch
+
+from .common import CalibrationData, PCAEntry
+from .gpu_ops import batch_quantize, greedy_bit_allocation
+from .pca import apply_rope_inverse, pca_transform
+from .vllm_triton import decode_attention_from_kvtc, dense_attention_state, merge_attention_states
+
+
+NEG_INF = float("-inf")
+
+
+@dataclass(frozen=True)
+class RequestSpan:
+    """Logical request slice inside a vLLM attention step."""
+
+    request_id: str
+    start: int
+    end: int
+    positions: torch.Tensor
+    seq_len: int
+    query_len: int
+
+
+@dataclass
+class QuantizedTensorSpec:
+    """Precomputed PCA/quantization state for one tensor kind."""
+
+    active_components: torch.Tensor
+    bit_widths: torch.Tensor
+    scales: torch.Tensor
+    zero_points: torch.Tensor
+    projection_basis: torch.Tensor
+    basis_t: torch.Tensor
+    mean: torch.Tensor
+    index_dtype: torch.dtype
+
+
+@dataclass
+class KVTCGroupConfig:
+    """Calibration-backed quantization config for one KV head group."""
+
+    group_idx: int
+    head_indices: tuple[int, ...]
+    key: QuantizedTensorSpec
+    value: QuantizedTensorSpec
+
+
+@dataclass
+class QuantizedGroupStorage:
+    """Compressed indices for one sequence and one head group."""
+
+    key_indices: torch.Tensor | None = None
+    value_indices: torch.Tensor | None = None
+
+
+@dataclass
+class KVTCSequenceState:
+    """Per-request KV state for one transformer layer."""
+
+    request_id: str
+    raw_keys: List[torch.Tensor] = field(default_factory=list)
+    raw_values: List[torch.Tensor] = field(default_factory=list)
+    raw_positions: List[torch.Tensor] = field(default_factory=list)
+    sinks_keys: torch.Tensor | None = None
+    sinks_values: torch.Tensor | None = None
+    window_keys: torch.Tensor | None = None
+    window_values: torch.Tensor | None = None
+    window_positions: torch.Tensor | None = None
+    middle_positions: torch.Tensor | None = None
+    compressed: Dict[int, QuantizedGroupStorage] = field(default_factory=dict)
+    finalized: bool = False
+
+    def has_prefill(self) -> bool:
+        return bool(self.raw_keys)
+
+
+@dataclass
+class PatchedLayer:
+    """Bookkeeping for a patched attention layer."""
+
+    prefix: str
+    layer_idx: int
+    layer: Any
+    impl: Any
+    state: "KVTCLayerState"
+    original_forward: Any
+    original_do_kv_cache_update: Any | None
+    original_kv_cache: Any | None = None
+
+
+def _to_cpu_list(value: Any) -> List[int]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        return [int(item) for item in value.detach().cpu().flatten().tolist()]
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    return [int(value)]
+
+
+def _num_actual_tokens(attn_metadata: Any, fallback: int) -> int:
+    if attn_metadata is None:
+        return fallback
+    for name in ("num_actual_tokens", "num_input_tokens"):
+        value = getattr(attn_metadata, name, None)
+        if value is not None:
+            return min(int(value), fallback)
+    return fallback
+
+
+def _request_id_from_block_table(attn_metadata: Any, row_idx: int, seq_len: int, start: int, end: int) -> str:
+    block_table = getattr(attn_metadata, "block_table", None)
+    if block_table is None:
+        block_table = getattr(attn_metadata, "block_tables", None)
+    if block_table is None:
+        return f"row-{row_idx}-seq-{seq_len}-tok-{start}-{end}"
+    row = block_table[row_idx]
+    if isinstance(row, torch.Tensor):
+        block_ids = row.detach().cpu().flatten().tolist()
+    else:
+        block_ids = list(row)
+    filtered = [int(block_id) for block_id in block_ids if int(block_id) >= 0]
+    if filtered:
+        return "blocks:" + ",".join(str(block_id) for block_id in filtered)
+    return f"row-{row_idx}-seq-{seq_len}-tok-{start}-{end}"
+
+
+def extract_request_spans(
+    attn_metadata: Any,
+    num_tokens: int,
+    *,
+    device: torch.device,
+) -> List[RequestSpan]:
+    """Split one attention step into per-request token spans."""
+
+    actual_tokens = _num_actual_tokens(attn_metadata, num_tokens)
+    if attn_metadata is None:
+        positions = torch.arange(actual_tokens, device=device, dtype=torch.long)
+        return [RequestSpan("request-0", 0, actual_tokens, positions, actual_tokens, actual_tokens)]
+
+    query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+    seq_lens = getattr(attn_metadata, "seq_lens", None)
+    if query_start_loc is None or seq_lens is None:
+        positions = torch.arange(actual_tokens, device=device, dtype=torch.long)
+        return [RequestSpan("request-0", 0, actual_tokens, positions, actual_tokens, actual_tokens)]
+
+    qsl = _to_cpu_list(query_start_loc)
+    if len(qsl) < 2:
+        positions = torch.arange(actual_tokens, device=device, dtype=torch.long)
+        return [RequestSpan("request-0", 0, actual_tokens, positions, actual_tokens, actual_tokens)]
+
+    seq_lens_list = _to_cpu_list(seq_lens)
+    spans: List[RequestSpan] = []
+    for row_idx, start in enumerate(qsl[:-1]):
+        end = min(qsl[row_idx + 1], actual_tokens)
+        if end <= start:
+            continue
+        query_len = end - start
+        seq_len = seq_lens_list[row_idx] if row_idx < len(seq_lens_list) else end
+        pos_start = max(seq_len - query_len, 0)
+        positions = torch.arange(pos_start, seq_len, device=device, dtype=torch.long)
+        request_id = _request_id_from_block_table(attn_metadata, row_idx, seq_len, start, end)
+        spans.append(RequestSpan(request_id, start, end, positions, seq_len, query_len))
+
+    if not spans:
+        positions = torch.arange(actual_tokens, device=device, dtype=torch.long)
+        spans.append(RequestSpan("request-0", 0, actual_tokens, positions, actual_tokens, actual_tokens))
+    return spans
+
+
+def _is_pure_decode(spans: Sequence[RequestSpan]) -> bool:
+    return bool(spans) and all(span.query_len == 1 for span in spans)
+
+
+def _parse_layer_idx(prefix: str, fallback: int) -> int:
+    matches = re.findall(r"\d+", prefix)
+    if not matches:
+        return fallback
+    return int(matches[-1])
+
+
+def _smallest_index_dtype(bit_widths: torch.Tensor) -> torch.dtype:
+    if bit_widths.numel() == 0:
+        return torch.uint8
+    max_bits = int(bit_widths.max().item())
+    if max_bits <= 8:
+        return torch.uint8
+    if max_bits <= 15:
+        return torch.int16
+    return torch.int32
+
+
+def _static_quant_params(entry: PCAEntry) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if entry.bit_widths is not None and entry.scales is not None and entry.zero_points is not None:
+        return (
+            entry.bit_widths.detach().clone().to(torch.int64),
+            entry.scales.detach().clone().to(torch.float32),
+            entry.zero_points.detach().clone().to(torch.float32),
+        )
+    if entry.pca_mins is None or entry.pca_maxs is None:
+        raise ValueError(
+            "Calibration entry is missing static quantization ranges. "
+            "Recompute calibration with the updated calibrator."
+        )
+    bit_widths = greedy_bit_allocation(entry.eigenvalues, entry.bit_budget)
+    mins = entry.pca_mins.to(torch.float32)
+    maxs = entry.pca_maxs.to(torch.float32)
+    bw = bit_widths.to(torch.float32)
+    nonzero = bw > 0
+    safe_bw = torch.where(nonzero, bw, torch.ones_like(bw))
+    qmax = (2.0 ** safe_bw) - 1.0
+    qmax = torch.where(nonzero, qmax, torch.ones_like(qmax))
+    span = (maxs - mins).clamp(min=1e-8)
+    scales = torch.where(nonzero, span / qmax, torch.ones_like(span))
+    zero_points = torch.where(nonzero, -mins / scales, torch.zeros_like(mins))
+    return bit_widths.to(torch.int64), scales, zero_points
+
+
+def _build_quant_spec(entry: PCAEntry) -> QuantizedTensorSpec:
+    bit_widths, scales, zero_points = _static_quant_params(entry)
+    active = torch.nonzero(bit_widths > 0, as_tuple=False).flatten()
+    eigenvectors = entry.eigenvectors.to(torch.float32)
+    projection_basis = eigenvectors[:, active].contiguous()
+    basis_t = eigenvectors.transpose(0, 1)[active].contiguous()
+    return QuantizedTensorSpec(
+        active_components=active,
+        bit_widths=bit_widths[active].contiguous(),
+        scales=scales[active].contiguous(),
+        zero_points=zero_points[active].contiguous(),
+        projection_basis=projection_basis,
+        basis_t=basis_t,
+        mean=entry.mean.to(torch.float32).contiguous(),
+        index_dtype=_smallest_index_dtype(bit_widths[active]),
+    )
+
+
+def _append_tensor(existing: torch.Tensor | None, new: torch.Tensor) -> torch.Tensor:
+    new = new.contiguous()
+    if existing is None:
+        return new
+    return torch.cat((existing, new), dim=0)
+
+
+def _dummy_like_cache(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return torch.empty((1,), device=value.device, dtype=value.dtype)
+    if isinstance(value, list):
+        return [_dummy_like_cache(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_dummy_like_cache(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _dummy_like_cache(item) for key, item in value.items()}
+    return value
+
+
+def resolve_attention_layers(model: Any) -> List[tuple[str, Any]]:
+    """Locate compiled vLLM attention layers for monkey-patching."""
+
+    queue: List[Any] = [model]
+    seen: set[int] = set()
+    attr_names = (
+        "model_runner",
+        "worker",
+        "driver_worker",
+        "model_executor",
+        "llm_engine",
+        "engine",
+        "executor",
+        "runner",
+        "model",
+    )
+    while queue:
+        current = queue.pop(0)
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        compilation_config = getattr(current, "compilation_config", None)
+        static_forward_context = getattr(compilation_config, "static_forward_context", None)
+        if isinstance(static_forward_context, dict):
+            layers = [
+                (prefix, layer)
+                for prefix, layer in static_forward_context.items()
+                if hasattr(layer, "impl") and hasattr(layer, "head_size")
+            ]
+            if layers:
+                return sorted(layers, key=lambda item: item[0])
+        for attr_name in attr_names:
+            child = getattr(current, attr_name, None)
+            if child is not None:
+                queue.append(child)
+
+    module = getattr(model, "model", model)
+    if hasattr(module, "named_modules"):
+        layers = [
+            (name, candidate)
+            for name, candidate in module.named_modules()
+            if hasattr(candidate, "impl") and hasattr(candidate, "head_size")
+        ]
+        if layers:
+            return layers
+    raise ValueError("Could not locate vLLM attention layers to patch.")
+
+
+class KVTCLayerState:
+    """Per-layer KVTC serving state."""
+
+    def __init__(
+        self,
+        layer_idx: int,
+        layer: Any,
+        calibration_data: CalibrationData,
+        *,
+        use_triton: bool = True,
+    ) -> None:
+        self.layer_idx = layer_idx
+        self.layer = layer
+        self.impl = getattr(layer, "impl")
+        self.calibration_data = calibration_data
+        self.use_triton = use_triton
+        self.active = False
+        self.head_dim = int(getattr(layer, "head_size"))
+        self.num_heads = int(getattr(layer, "num_heads", getattr(self.impl, "num_heads", 0)))
+        self.num_kv_heads = int(getattr(layer, "num_kv_heads", getattr(self.impl, "num_kv_heads", 0)))
+        if self.num_heads <= 0 or self.num_kv_heads <= 0:
+            raise ValueError(f"Layer {layer_idx} is missing num_heads/num_kv_heads metadata.")
+        self.queries_per_kv = max(self.num_heads // self.num_kv_heads, 1)
+        self.head_group_size = calibration_data.head_group_size
+        self.rope_theta = calibration_data.rope_theta
+        self.sink_tokens = calibration_data.sink_tokens
+        self.window_tokens = calibration_data.window_tokens
+        self.softmax_scale = float(getattr(self.impl, "scale", 1.0 / math.sqrt(self.head_dim)))
+        self.logits_soft_cap = getattr(self.impl, "logits_soft_cap", None)
+        self.groups = self._build_groups()
+        self.sequences: Dict[str, KVTCSequenceState] = {}
+
+    def _build_groups(self) -> Dict[int, KVTCGroupConfig]:
+        groups: Dict[int, KVTCGroupConfig] = {}
+        for group_idx, start in enumerate(range(0, self.num_kv_heads, self.head_group_size)):
+            key_entry = self.calibration_data.entries[(self.layer_idx, group_idx, "keys")]
+            value_entry = self.calibration_data.entries[(self.layer_idx, group_idx, "values")]
+            head_stop = min(start + self.head_group_size, self.num_kv_heads)
+            groups[group_idx] = KVTCGroupConfig(
+                group_idx=group_idx,
+                head_indices=tuple(range(start, head_stop)),
+                key=_build_quant_spec(key_entry),
+                value=_build_quant_spec(value_entry),
+            )
+        return groups
+
+    def has_prefill_data(self) -> bool:
+        return any(sequence.has_prefill() for sequence in self.sequences.values())
+
+    def _sequence(self, request_id: str) -> KVTCSequenceState:
+        sequence = self.sequences.get(request_id)
+        if sequence is None:
+            sequence = KVTCSequenceState(request_id=request_id)
+            self.sequences[request_id] = sequence
+        return sequence
+
+    def capture(self, key: torch.Tensor, value: torch.Tensor, spans: Sequence[RequestSpan]) -> None:
+        for span in spans:
+            key_tokens = key[span.start : span.end].detach()
+            value_tokens = value[span.start : span.end].detach()
+            positions = span.positions.detach()
+            if key_tokens.numel() == 0:
+                continue
+            sequence = self._sequence(span.request_id)
+            if not self.active:
+                sequence.raw_keys.append(key_tokens.contiguous())
+                sequence.raw_values.append(value_tokens.contiguous())
+                sequence.raw_positions.append(positions.contiguous())
+            else:
+                self._append_active_tokens(sequence, key_tokens, value_tokens, positions)
+
+    def finalize_prefill(self) -> None:
+        for sequence in self.sequences.values():
+            self._finalize_sequence(sequence)
+        self.active = True
+
+    def _finalize_sequence(self, sequence: KVTCSequenceState) -> None:
+        if sequence.finalized:
+            return
+        if sequence.raw_keys:
+            keys = torch.cat(sequence.raw_keys, dim=0)
+            values = torch.cat(sequence.raw_values, dim=0)
+            positions = torch.cat(sequence.raw_positions, dim=0)
+        else:
+            sequence.sinks_keys = None
+            sequence.sinks_values = None
+            sequence.window_keys = None
+            sequence.window_values = None
+            sequence.window_positions = None
+            sequence.middle_positions = None
+            sequence.finalized = True
+            return
+
+        total_tokens = int(keys.shape[0])
+        sink_len = min(self.sink_tokens, total_tokens)
+        residual = max(total_tokens - sink_len, 0)
+        window_len = min(self.window_tokens, residual)
+        middle_start = sink_len
+        middle_end = total_tokens - window_len
+
+        sequence.sinks_keys = keys[:sink_len].contiguous()
+        sequence.sinks_values = values[:sink_len].contiguous()
+        sequence.window_keys = keys[middle_end:].contiguous()
+        sequence.window_values = values[middle_end:].contiguous()
+        sequence.window_positions = positions[middle_end:].contiguous()
+        sequence.middle_positions = None
+
+        middle_keys = keys[middle_start:middle_end]
+        middle_values = values[middle_start:middle_end]
+        if middle_keys.numel():
+            self._compress_middle_chunk(sequence, middle_keys, middle_values, positions[middle_start:middle_end].contiguous())
+
+        sequence.raw_keys.clear()
+        sequence.raw_values.clear()
+        sequence.raw_positions.clear()
+        sequence.finalized = True
+
+    def _append_active_tokens(
+        self,
+        sequence: KVTCSequenceState,
+        key_tokens: torch.Tensor,
+        value_tokens: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        if not sequence.finalized:
+            self._finalize_sequence(sequence)
+
+        for token_idx in range(int(key_tokens.shape[0])):
+            key_token = key_tokens[token_idx : token_idx + 1].contiguous()
+            value_token = value_tokens[token_idx : token_idx + 1].contiguous()
+            pos_token = positions[token_idx : token_idx + 1].contiguous()
+            sink_len = 0 if sequence.sinks_keys is None else int(sequence.sinks_keys.shape[0])
+            if sink_len < self.sink_tokens:
+                sequence.sinks_keys = _append_tensor(sequence.sinks_keys, key_token)
+                sequence.sinks_values = _append_tensor(sequence.sinks_values, value_token)
+                continue
+
+            sequence.window_keys = _append_tensor(sequence.window_keys, key_token)
+            sequence.window_values = _append_tensor(sequence.window_values, value_token)
+            sequence.window_positions = _append_tensor(sequence.window_positions, pos_token)
+
+            if self.window_tokens <= 0:
+                overflow = sequence.window_keys
+                overflow_values = sequence.window_values
+                overflow_positions = sequence.window_positions
+                sequence.window_keys = sequence.window_keys[0:0]
+                sequence.window_values = sequence.window_values[0:0]
+                sequence.window_positions = sequence.window_positions[0:0]
+                self._compress_middle_chunk(sequence, overflow, overflow_values, overflow_positions)
+                continue
+
+            excess = int(sequence.window_keys.shape[0] - self.window_tokens)
+            if excess > 0:
+                overflow_keys = sequence.window_keys[:excess].contiguous()
+                overflow_values = sequence.window_values[:excess].contiguous()
+                overflow_positions = sequence.window_positions[:excess].contiguous()
+                sequence.window_keys = sequence.window_keys[excess:].contiguous()
+                sequence.window_values = sequence.window_values[excess:].contiguous()
+                sequence.window_positions = sequence.window_positions[excess:].contiguous()
+                self._compress_middle_chunk(sequence, overflow_keys, overflow_values, overflow_positions)
+
+    def _compress_middle_chunk(
+        self,
+        sequence: KVTCSequenceState,
+        middle_keys: torch.Tensor,
+        middle_values: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        if middle_keys.numel() == 0:
+            return
+        sequence.middle_positions = _append_tensor(sequence.middle_positions, positions)
+        for group_idx, group in self.groups.items():
+            start = group.head_indices[0]
+            stop = start + len(group.head_indices)
+            group_keys = middle_keys[:, start:stop, :]
+            group_values = middle_values[:, start:stop, :]
+            key_indices = self._quantize(group_keys, positions, group.key, undo_rope=True)
+            value_indices = self._quantize(group_values, positions, group.value, undo_rope=False)
+            storage = sequence.compressed.setdefault(group_idx, QuantizedGroupStorage())
+            storage.key_indices = _append_tensor(storage.key_indices, key_indices)
+            storage.value_indices = _append_tensor(storage.value_indices, value_indices)
+
+    def _quantize(
+        self,
+        tensor: torch.Tensor,
+        positions: torch.Tensor,
+        spec: QuantizedTensorSpec,
+        *,
+        undo_rope: bool,
+    ) -> torch.Tensor:
+        tokens, group_heads, _ = tensor.shape
+        if spec.active_components.numel() == 0:
+            return torch.empty((tokens, group_heads, 0), device=tensor.device, dtype=spec.index_dtype)
+        work = tensor
+        if undo_rope:
+            work = apply_rope_inverse(
+                work,
+                positions.to(device=tensor.device, dtype=torch.long),
+                rope_theta=self.rope_theta,
+                head_dim=self.head_dim,
+            )
+        rows = work.reshape(tokens * group_heads, self.head_dim).to(torch.float32)
+        centered = rows - spec.mean.to(device=rows.device, dtype=rows.dtype)
+        pca_values = pca_transform(centered, spec.projection_basis.to(device=rows.device, dtype=rows.dtype))
+        indices = batch_quantize(
+            pca_values,
+            spec.bit_widths.to(device=rows.device),
+            spec.scales.to(device=rows.device),
+            spec.zero_points.to(device=rows.device),
+        )
+        return indices.to(spec.index_dtype).reshape(tokens, group_heads, -1).contiguous()
+
+    def decode_request(self, request_id: str, query: torch.Tensor) -> torch.Tensor:
+        sequence = self.sequences.get(request_id)
+        if sequence is None:
+            raise KeyError(f"Layer {self.layer_idx} has no KVTC state for request {request_id}.")
+
+        output = torch.empty_like(query)
+        for head_idx in range(self.num_heads):
+            kv_head_idx = min(head_idx // self.queries_per_kv, self.num_kv_heads - 1)
+            group_idx = kv_head_idx // self.head_group_size
+            local_head_idx = kv_head_idx - self.groups[group_idx].head_indices[0]
+            output[head_idx] = self._decode_one_head(sequence, self.groups[group_idx], kv_head_idx, local_head_idx, query[head_idx])
+        return output
+
+    def _decode_one_head(
+        self,
+        sequence: KVTCSequenceState,
+        group: KVTCGroupConfig,
+        kv_head_idx: int,
+        local_head_idx: int,
+        query: torch.Tensor,
+    ) -> torch.Tensor:
+        device = query.device
+        merged_output = torch.zeros(self.head_dim, device=device, dtype=query.dtype)
+        merged_lse = torch.tensor(NEG_INF, device=device, dtype=torch.float32)
+
+        if sequence.sinks_keys is not None and sequence.sinks_keys.numel():
+            sink_output, sink_lse = dense_attention_state(
+                query,
+                sequence.sinks_keys[:, kv_head_idx, :].to(device=device, dtype=query.dtype),
+                sequence.sinks_values[:, kv_head_idx, :].to(device=device, dtype=query.dtype),
+                softmax_scale=self.softmax_scale,
+                logits_soft_cap=self.logits_soft_cap,
+            )
+            merged_output, merged_lse = merge_attention_states(merged_output, merged_lse, sink_output, sink_lse)
+
+        storage = sequence.compressed.get(group.group_idx)
+        middle_positions = sequence.middle_positions
+        if (
+            storage is not None
+            and storage.key_indices is not None
+            and storage.value_indices is not None
+            and middle_positions is not None
+            and storage.key_indices.shape[0] > 0
+        ):
+            middle_output, middle_lse = decode_attention_from_kvtc(
+                query,
+                storage.key_indices[:, local_head_idx, :].to(device=device),
+                storage.value_indices[:, local_head_idx, :].to(device=device),
+                group.key.scales.to(device=device),
+                group.key.zero_points.to(device=device),
+                group.value.scales.to(device=device),
+                group.value.zero_points.to(device=device),
+                group.key.basis_t.to(device=device),
+                group.value.basis_t.to(device=device),
+                group.key.mean.to(device=device),
+                group.value.mean.to(device=device),
+                middle_positions.to(device=device),
+                rope_theta=self.rope_theta,
+                softmax_scale=self.softmax_scale,
+                logits_soft_cap=self.logits_soft_cap,
+                use_triton=self.use_triton,
+            )
+            merged_output, merged_lse = merge_attention_states(merged_output, merged_lse, middle_output, middle_lse)
+
+        if sequence.window_keys is not None and sequence.window_keys.numel():
+            window_output, window_lse = dense_attention_state(
+                query,
+                sequence.window_keys[:, kv_head_idx, :].to(device=device, dtype=query.dtype),
+                sequence.window_values[:, kv_head_idx, :].to(device=device, dtype=query.dtype),
+                softmax_scale=self.softmax_scale,
+                logits_soft_cap=self.logits_soft_cap,
+            )
+            merged_output, merged_lse = merge_attention_states(merged_output, merged_lse, window_output, window_lse)
+
+        return merged_output
+
+
+class PatchedCacheUpdate:
+    """Intercept vLLM cache writes once KVTC is active."""
+
+    def __init__(self, handle: "KVTCHandle", original: Any | None) -> None:
+        self.handle = handle
+        self.original = original
+
+    def __call__(self, impl: Any, layer: Any, key: torch.Tensor, value: torch.Tensor, kv_cache: Any, slot_mapping: Any) -> Any:
+        if self.handle.active:
+            return None
+        if self.original is None:
+            return None
+        return self.original(layer, key, value, kv_cache, slot_mapping)
+
+
+class PatchedForward:
+    """Capture KV updates and route decode through KVTC."""
+
+    def __init__(self, handle: "KVTCHandle", state: KVTCLayerState, original: Any) -> None:
+        self.handle = handle
+        self.state = state
+        self.original = original
+
+    def __call__(
+        self,
+        impl: Any,
+        layer: Any,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: Any,
+        attn_metadata: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if query.dim() != 3 or key.dim() != 3 or value.dim() != 3:
+            return self.original(layer, query, key, value, kv_cache, attn_metadata, *args, **kwargs)
+
+        spans = extract_request_spans(attn_metadata, int(query.shape[0]), device=key.device)
+        pure_decode = _is_pure_decode(spans)
+        if self.handle.auto_activate and not self.handle.active and pure_decode and self.handle.has_prefill_data():
+            self.handle.free_kv_cache()
+
+        self.state.capture(key, value, spans)
+
+        if not self.handle.active:
+            return self.original(layer, query, key, value, kv_cache, attn_metadata, *args, **kwargs)
+
+        if not pure_decode:
+            raise RuntimeError("KVTC decode path only supports pure decode batches after activation.")
+
+        extra_kwargs = dict(kwargs)
+        output = extra_kwargs.pop("output", args[0] if args else None)
+        if extra_kwargs or len(args) > 1:
+            raise RuntimeError("Unsupported vLLM attention signature on KVTC decode path.")
+
+        output_tensor = output if output is not None else torch.empty_like(query)
+        output_view = output_tensor.view_as(query) if output_tensor.dim() == 2 else output_tensor
+        for span in spans:
+            query_slice = query[span.start : span.end]
+            decoded = self.state.decode_request(span.request_id, query_slice[0])
+            output_view[span.start] = decoded
+        return output_tensor
+
+
+class KVTCHandle:
+    """Handle returned by hook_model for activation and cleanup."""
+
+    def __init__(self, model: Any, patched_layers: Sequence[PatchedLayer], *, auto_activate: bool = False) -> None:
+        self.model = model
+        self.patched_layers = list(patched_layers)
+        self.auto_activate = auto_activate
+        self.active = False
+        self.free_timestamp: float | None = None
+
+    def has_prefill_data(self) -> bool:
+        return any(layer.state.has_prefill_data() for layer in self.patched_layers)
+
+    def free_kv_cache(self) -> None:
+        if self.active:
+            return
+        for layer in self.patched_layers:
+            layer.state.finalize_prefill()
+        for layer in self.patched_layers:
+            if hasattr(layer.layer, "kv_cache"):
+                layer.original_kv_cache = getattr(layer.layer, "kv_cache")
+                setattr(layer.layer, "kv_cache", _dummy_like_cache(layer.original_kv_cache))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.active = True
+        self.free_timestamp = time.perf_counter()
+
+    def unhook(self) -> None:
+        for layer in self.patched_layers:
+            layer.impl.forward = layer.original_forward
+            if layer.original_do_kv_cache_update is not None:
+                layer.impl.do_kv_cache_update = layer.original_do_kv_cache_update
+            if layer.original_kv_cache is not None and hasattr(layer.layer, "kv_cache"):
+                setattr(layer.layer, "kv_cache", layer.original_kv_cache)
+        self.active = False
+
+
+def hook_model(
+    model: Any,
+    calibration_data: CalibrationData,
+    *,
+    auto_activate: bool = False,
+    use_triton: bool = True,
+) -> KVTCHandle:
+    """Patch vLLM attention layers so decode reads from KVTC state."""
+
+    patched_layers: List[PatchedLayer] = []
+    for fallback_idx, (prefix, layer) in enumerate(resolve_attention_layers(model)):
+        layer_idx = _parse_layer_idx(prefix, fallback_idx)
+        impl = layer.impl
+        patched_layers.append(
+            PatchedLayer(
+                prefix=prefix,
+                layer_idx=layer_idx,
+                layer=layer,
+                impl=impl,
+                state=KVTCLayerState(layer_idx, layer, calibration_data, use_triton=use_triton),
+                original_forward=impl.forward,
+                original_do_kv_cache_update=getattr(impl, "do_kv_cache_update", None),
+            )
+        )
+
+    handle = KVTCHandle(model, patched_layers, auto_activate=auto_activate)
+    for layer in patched_layers:
+        layer.impl.forward = types.MethodType(PatchedForward(handle, layer.state, layer.original_forward), layer.impl)
+        if layer.original_do_kv_cache_update is not None:
+            layer.impl.do_kv_cache_update = types.MethodType(
+                PatchedCacheUpdate(handle, layer.original_do_kv_cache_update),
+                layer.impl,
+            )
+    setattr(model, "_kvtc_handle", handle)
+    return handle
+
+
+def free_kv_cache(model_or_handle: Any) -> KVTCHandle:
+    """Finalize KVTC state and release vLLM's paged KV cache."""
+
+    if isinstance(model_or_handle, KVTCHandle):
+        handle = model_or_handle
+    else:
+        handle = getattr(model_or_handle, "_kvtc_handle", None)
+        if handle is None:
+            raise ValueError("Model has not been patched with hook_model().")
+    handle.free_kv_cache()
+    return handle
+
+
+__all__ = [
+    "KVTCLayerState",
+    "KVTCHandle",
+    "PatchedCacheUpdate",
+    "PatchedForward",
+    "extract_request_spans",
+    "free_kv_cache",
+    "hook_model",
+    "resolve_attention_layers",
+]
