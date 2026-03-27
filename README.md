@@ -40,6 +40,8 @@ Overall compression (including FP16 sinks + window): 1.9–3.4×. Middle-section
 Sinks (4 tokens) and sliding window (32 tokens) preserved exactly in FP16.
 Tested on **NVIDIA RTX 5090 (32GB)** with PyTorch 2.10 + CUDA 12.8.
 
+**GPU-accelerated pipeline** (`KVTCCompressorFast`): 808ms compress for 512 tokens — **10.4× faster** than reference implementation. Breakdown: PCA=31ms, DP=23ms, Quant=35ms, Pack=712ms.
+
 ## Architecture
 
 ```
