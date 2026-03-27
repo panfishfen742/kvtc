@@ -29,13 +29,15 @@ KV caches grow linearly with context length and can consume multiple gigabytes f
 
 ### Our Results — RTX 5090 (32GB), PyTorch 2.10, CUDA 12.8
 
-#### Mistral-7B-Instruct-v0.3 (32 layers × 8 heads × dim=128, 513 tokens)
+#### Multi-Model Validation (RTX 5090, 15 calibration samples, 5.6 bits/value)
 
-| Bit Budget | Avg Bits | Middle Compression | Key Cosine | Value Cosine | Key MSE |
-|:----------:|:--------:|:------------------:|:----------:|:------------:|:-------:|
-| 0.35 | 5.6 | **2.9×** | **0.9979** | **0.9991** | 0.0099 |
+| Model | Params | Layers × Heads × Dim | Key Cosine | Value Cosine | Compression |
+|-------|:------:|:--------------------:|:----------:|:------------:|:-----------:|
+| **Mistral-7B-Instruct** | 7.2B | 32 × 8 × 128 | **0.9979** | **0.9991** | 2.9× |
+| **Qwen 2.5-3B-Instruct** | 3.1B | 36 × 2 × 128 | **0.9993** | **0.9995** | 2.9× |
+| **TinyLlama-1.1B** | 1.1B | 22 × 4 × 64 | **0.9536** | **0.9600** | 5.8× |
 
-**Near-perfect quality** at 2.9× compression on a production 7B model. Calibrated with 15 diverse paragraph-length texts.
+**Near-perfect quality** (0.998+ cosine) at 2.9× compression across production-sized models. Calibrated with 15 diverse paragraph-length texts.
 
 #### TinyLlama-1.1B (22 layers × 4 heads × dim=64, 513 tokens)
 
