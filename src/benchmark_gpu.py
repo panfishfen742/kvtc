@@ -241,7 +241,7 @@ def main():
     parser.add_argument("--model", default="TinyLlama/TinyLlama-1.1B-Chat-v1.0", help="HuggingFace model name")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="Device to run on")
     parser.add_argument("--seq-len", type=int, default=512, help="Target sequence length for benchmark")
-    parser.add_argument("--calibration-samples", type=int, default=10, help="Number of calibration samples")
+    parser.add_argument("--calibration-samples", type=int, default=15, help="Number of calibration samples")
     parser.add_argument("--bit-budget-ratio", type=float, default=0.25, help="Bit budget as fraction of FP16")
     parser.add_argument("--sink-tokens", type=int, default=4, help="Number of attention sink tokens to preserve")
     parser.add_argument("--window-tokens", type=int, default=32, help="Sliding window size to preserve")
@@ -310,19 +310,28 @@ def main():
     print(f"\n[2/4] Calibrating PCA bases ({args.calibration_samples} samples)...")
     from src.calibrate import KVTCCalibrator
     
+    # Longer, more diverse calibration texts for better PCA bases
     calibration_texts = [
-        "KV cache compression can unlock longer contexts in language models.",
-        "Dynamic programming assigns bits where variance matters most.",
-        "Principal components capture the most important directions in data.",
-        "Attention sinks at the beginning of sequences should be preserved exactly.",
-        "Random rotation decorrelates features before quantization.",
-        "Entropy coding exploits low-entropy streams for additional compression.",
-        "RoPE positional encoding must be undone before applying PCA to keys.",
-        "Sliding window attention keeps recent tokens uncompressed.",
-        "The bit allocation problem is solved optimally via dynamic programming.",
-        "Transformer KV caches grow linearly with sequence length.",
-        "Modern LLMs require efficient memory management for long contexts.",
-        "Quantization introduces controlled error in exchange for compression.",
+        "KV cache compression can unlock longer contexts in language models. The key insight is that KV vectors exhibit strong low-rank structure that can be exploited through principal component analysis. By projecting onto the top principal components and quantizing adaptively, we achieve near-lossless compression at high ratios.",
+        "Dynamic programming assigns bits where variance matters most. The optimal bit allocation minimizes total reconstruction error subject to a bit budget constraint. Components with higher eigenvalues receive more bits, while low-variance components can be pruned entirely.",
+        "Principal components capture the most important directions in data. Singular value decomposition reveals the latent structure in high-dimensional vectors. The eigenvectors form an orthonormal basis that decorrelates the data, making each dimension independently quantizable.",
+        "Attention sinks at the beginning of sequences should be preserved exactly. Research has shown that the first few tokens accumulate disproportionate attention weight regardless of content. Compressing these tokens degrades quality significantly, so they are kept in full precision.",
+        "Random rotation decorrelates features before quantization. The Johnson-Lindenstrauss lemma guarantees that random projections preserve pairwise distances. This property is exploited in both TurboQuant and KVTC for different purposes.",
+        "The theory of relativity was developed by Albert Einstein in the early twentieth century. Special relativity deals with objects moving at constant velocities near the speed of light, while general relativity describes gravity as the curvature of spacetime caused by mass and energy.",
+        "Machine learning algorithms learn patterns from data through optimization. Gradient descent iteratively adjusts model parameters to minimize a loss function. Modern deep learning uses stochastic gradient descent with momentum and adaptive learning rates.",
+        "The architecture of transformer models consists of stacked layers of multi-head self-attention and feed-forward networks. Each attention head computes queries, keys, and values from the input, then uses scaled dot-product attention to weight the values.",
+        "Python is a versatile programming language used extensively in scientific computing, web development, and artificial intelligence. Its ecosystem includes libraries like NumPy for numerical computing, PyTorch for deep learning, and transformers for natural language processing.",
+        "Cryptocurrency markets operate twenty-four hours a day, seven days a week, with prices determined by supply and demand on decentralized exchanges. Bitcoin remains the largest cryptocurrency by market capitalization, followed by Ethereum.",
+        "The history of computing spans from mechanical calculators through vacuum tube computers to modern silicon chips. Moore's law predicted that transistor density would double approximately every two years, a trend that held for decades.",
+        "Quantum computing leverages quantum mechanical phenomena like superposition and entanglement to perform certain calculations exponentially faster than classical computers. Shor's algorithm can factor large numbers efficiently, threatening current encryption.",
+        "Neural network architectures have evolved from simple perceptrons to complex convolutional, recurrent, and transformer models. Each architecture excels at different types of tasks depending on the structure of the input data.",
+        "The process of protein folding determines the three-dimensional structure of proteins from their amino acid sequences. AlphaFold demonstrated that deep learning could predict protein structures with remarkable accuracy.",
+        "Climate science relies on complex numerical models that simulate atmospheric and oceanic circulation patterns. These models must account for radiation, convection, precipitation, and feedback loops between different components of the Earth system.",
+        "Modern GPU architectures include thousands of parallel processing cores optimized for matrix operations. Tensor cores provide dedicated hardware for mixed-precision matrix multiplication, accelerating deep learning training and inference.",
+        "The development of large language models has progressed from word embeddings through recurrent networks to the transformer architecture. Scaling laws suggest that model performance improves predictably with increased data, compute, and parameters.",
+        "Database systems use indexing structures like B-trees and hash tables to enable efficient data retrieval. Query optimization transforms declarative SQL statements into efficient execution plans that minimize disk I/O and memory usage.",
+        "Operating systems manage hardware resources and provide abstractions for application programs. The kernel handles process scheduling, memory management, file systems, device drivers, and inter-process communication.",
+        "Natural language processing encompasses tasks like tokenization, parsing, named entity recognition, sentiment analysis, machine translation, question answering, and text generation. Modern approaches use pre-trained transformer models fine-tuned for specific tasks.",
     ]
     
     calibrator = KVTCCalibrator(head_group_size=1)
