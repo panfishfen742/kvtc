@@ -12,13 +12,16 @@ def greedy_bit_allocation(
     bit_budget: int,
     max_bits: int = 16,
 ) -> torch.Tensor:
-    """Fully vectorized greedy bit allocation.
+    """Vectorized greedy bit allocation via precomputed gain sorting.
     
     Minimizes sum(λᵢ / 4^bᵢ) subject to sum(bᵢ) ≤ B.
     
-    Instead of looping B times with argmax, we precompute all possible
-    (component, bit_level) gains and sort them. Then greedily take the
-    top B gains. This is O(d × max_bits × log(d × max_bits)) — one sort.
+    gain(i, b) = λᵢ × 3 / 4^b = marginal MSE reduction from assigning
+    the b-th bit to component i. We precompute ALL gains, sort them,
+    and greedily take the top B. Each entry (i, b) is only valid if
+    all entries (i, 1), (i, 2), ..., (i, b-1) are also taken.
+    Since gains are monotonically decreasing in b for each i, the
+    sorted order naturally respects this constraint.
     """
     d = eigenvalues.numel()
     ev = eigenvalues.detach().to(torch.float64).flatten()
@@ -27,32 +30,28 @@ def greedy_bit_allocation(
     if budget == 0 or d == 0:
         return torch.zeros(d, dtype=torch.int64)
     
-    # Precompute gain of going from (b-1) to b bits for each component:
-    # gain(i, b) = λᵢ × (1/4^(b-1) - 1/4^b) = λᵢ × 3 / 4^b
-    # Create a flat array of all possible gains
+    # gains_matrix[i, b-1] = λᵢ × 3 / 4^b (gain of b-th bit on component i)
     bit_levels = torch.arange(1, max_bits + 1, dtype=torch.float64)  # [max_bits]
-    # gains[i, b] = λᵢ × 3 / 4^b
     gains_matrix = ev.unsqueeze(1) * 3.0 / (4.0 ** bit_levels.unsqueeze(0))  # [d, max_bits]
     
-    # Flatten, sort descending, take top `budget` entries
-    flat_gains = gains_matrix.flatten()
-    if budget >= flat_gains.numel():
-        # Can assign max_bits to everything
+    flat_gains = gains_matrix.flatten()  # [d * max_bits]
+    total_slots = flat_gains.numel()
+    
+    if budget >= total_slots:
         return torch.full((d,), max_bits, dtype=torch.int64)
     
-    # Get indices of top `budget` gains
-    _, top_indices = torch.topk(flat_gains, min(budget, flat_gains.numel()))
+    # Take the top `budget` gains
+    _, top_indices = torch.topk(flat_gains, min(budget, total_slots))
     
-    # Convert flat indices back to (component, bit_level)
-    comp_indices = top_indices // max_bits
+    # Each index maps to (component, bit_level):
+    # index = component * max_bits + (bit_level - 1)
+    # For each component, the NUMBER of its entries in top-B = its bit allocation
+    # This works because gains are monotonically decreasing in bit_level,
+    # so if the 3rd bit of component i is taken, bits 1 and 2 must also be taken.
+    comp_indices = top_indices // max_bits  # [budget]
     
-    # Count how many bits each component gets
-    bits = torch.zeros(d, dtype=torch.int64)
-    for idx in comp_indices.tolist():
-        comp = idx // max_bits
-        bits[comp] += 1
-    
-    # Clamp to max_bits
+    # Count occurrences per component using bincount
+    bits = torch.bincount(comp_indices, minlength=d).to(torch.int64)[:d]
     bits = bits.clamp(max=max_bits)
     
     return bits
