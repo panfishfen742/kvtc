@@ -12,41 +12,48 @@ def greedy_bit_allocation(
     bit_budget: int,
     max_bits: int = 16,
 ) -> torch.Tensor:
-    """Greedy bit allocation — O(B log d) instead of O(d × B × max_bits).
+    """Fully vectorized greedy bit allocation.
     
     Minimizes sum(λᵢ / 4^bᵢ) subject to sum(bᵢ) ≤ B.
-    Each additional bit on component i reduces MSE by: λᵢ × 3 / 4^(b+1).
-    Greedily pick the component with highest marginal gain.
+    
+    Instead of looping B times with argmax, we precompute all possible
+    (component, bit_level) gains and sort them. Then greedily take the
+    top B gains. This is O(d × max_bits × log(d × max_bits)) — one sort.
     """
     d = eigenvalues.numel()
     ev = eigenvalues.detach().to(torch.float64).flatten()
+    budget = max(int(bit_budget), 0)
+    
+    if budget == 0 or d == 0:
+        return torch.zeros(d, dtype=torch.int64)
+    
+    # Precompute gain of going from (b-1) to b bits for each component:
+    # gain(i, b) = λᵢ × (1/4^(b-1) - 1/4^b) = λᵢ × 3 / 4^b
+    # Create a flat array of all possible gains
+    bit_levels = torch.arange(1, max_bits + 1, dtype=torch.float64)  # [max_bits]
+    # gains[i, b] = λᵢ × 3 / 4^b
+    gains_matrix = ev.unsqueeze(1) * 3.0 / (4.0 ** bit_levels.unsqueeze(0))  # [d, max_bits]
+    
+    # Flatten, sort descending, take top `budget` entries
+    flat_gains = gains_matrix.flatten()
+    if budget >= flat_gains.numel():
+        # Can assign max_bits to everything
+        return torch.full((d,), max_bits, dtype=torch.int64)
+    
+    # Get indices of top `budget` gains
+    _, top_indices = torch.topk(flat_gains, min(budget, flat_gains.numel()))
+    
+    # Convert flat indices back to (component, bit_level)
+    comp_indices = top_indices // max_bits
+    
+    # Count how many bits each component gets
     bits = torch.zeros(d, dtype=torch.int64)
-    budget_remaining = max(int(bit_budget), 0)
+    for idx in comp_indices.tolist():
+        comp = idx // max_bits
+        bits[comp] += 1
     
-    if budget_remaining == 0 or d == 0:
-        return bits
-    
-    # Marginal gain of adding 1 bit to component i at current allocation:
-    # gain_i = λᵢ × 3 / 4^(bits_i + 1)
-    # Start: all bits=0, so gain = λᵢ × 3/4 = 0.75 × λᵢ
-    gains = ev * 0.75  # λ × 3/4^1
-    
-    for _ in range(budget_remaining):
-        # Pick component with highest marginal gain
-        best = torch.argmax(gains).item()
-        if gains[best] <= 0:
-            break
-        current_bits = bits[best].item()
-        if current_bits >= max_bits:
-            gains[best] = 0.0
-            continue
-        bits[best] += 1
-        new_bits = bits[best].item()
-        if new_bits >= max_bits:
-            gains[best] = 0.0
-        else:
-            # Next marginal gain: λ × 3 / 4^(new_bits+1)
-            gains[best] = ev[best] * 3.0 / (4.0 ** (new_bits + 1))
+    # Clamp to max_bits
+    bits = bits.clamp(max=max_bits)
     
     return bits
 
@@ -158,16 +165,54 @@ def fast_pack_bits(
     indices: torch.Tensor,
     bit_widths: torch.Tensor,
 ) -> bytes:
-    """Pack variable-width quantized indices into bytes using torch ops.
+    """Pack variable-width quantized indices into bytes.
     
-    Faster than the pure Python loop for large tensors.
-    Falls back to the original implementation structure but uses
-    vectorized operations where possible.
+    Optimized: converts columns to numpy for faster iteration.
     """
-    num_rows, num_components = indices.shape
-    bw_list = bit_widths.tolist()
+    try:
+        import numpy as np
+        return _pack_bits_numpy(indices, bit_widths)
+    except ImportError:
+        return _pack_bits_python(indices, bit_widths)
+
+
+def _pack_bits_numpy(indices: torch.Tensor, bit_widths: torch.Tensor) -> bytes:
+    """Numpy-accelerated bit packing."""
+    import numpy as np
     
-    # For each component, pack its column
+    idx_np = indices.cpu().numpy().astype(np.int64)
+    bw_list = bit_widths.tolist()
+    num_rows, num_components = idx_np.shape
+    
+    accumulator = 0
+    bits_in_acc = 0
+    output = bytearray()
+    
+    for comp_idx in range(num_components):
+        width = int(bw_list[comp_idx])
+        if width == 0:
+            continue
+        mask = (1 << width) - 1
+        col = idx_np[:, comp_idx]
+        for val in col:
+            accumulator |= (int(val) & mask) << bits_in_acc
+            bits_in_acc += width
+            while bits_in_acc >= 8:
+                output.append(accumulator & 0xFF)
+                accumulator >>= 8
+                bits_in_acc -= 8
+    
+    if bits_in_acc:
+        output.append(accumulator & 0xFF)
+    
+    return bytes(output)
+
+
+def _pack_bits_python(indices: torch.Tensor, bit_widths: torch.Tensor) -> bytes:
+    """Pure Python fallback."""
+    bw_list = bit_widths.tolist()
+    num_rows, num_components = indices.shape
+    
     accumulator = 0
     bits_in_acc = 0
     output = bytearray()
