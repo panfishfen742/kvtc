@@ -87,3 +87,4 @@ class CompressedKVCache:
     window: Dict[str, torch.Tensor]
     compressed_sections: List[CompressedSection] = field(default_factory=list)
     metadata: CompressionMetadata | None = None
+

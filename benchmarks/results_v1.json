@@ -1,0 +1,60 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "results": [
+    {
+      "bit_budget": 1,
+      "compression_ratio": 18.84,
+      "cosine_sim_keys": 0.985978,
+      "cosine_sim_values": 0.636755,
+      "max_error": 34.34137,
+      "compress_ms": 357.4,
+      "decompress_ms": 7629.3
+    },
+    {
+      "bit_budget": 2,
+      "compression_ratio": 9.73,
+      "cosine_sim_keys": 0.991983,
+      "cosine_sim_values": 0.736817,
+      "max_error": 24.123686,
+      "compress_ms": 469.0,
+      "decompress_ms": 10384.9
+    },
+    {
+      "bit_budget": 3,
+      "compression_ratio": 6.09,
+      "cosine_sim_keys": 0.999843,
+      "cosine_sim_values": 0.956638,
+      "max_error": 7.187998,
+      "compress_ms": 491.6,
+      "decompress_ms": 10436.3
+    },
+    {
+      "bit_budget": 4,
+      "compression_ratio": 4.37,
+      "cosine_sim_keys": 1.000613,
+      "cosine_sim_values": 0.99154,
+      "max_error": 2.821277,
+      "compress_ms": 537.1,
+      "decompress_ms": 10561.1
+    },
+    {
+      "bit_budget": 6,
+      "compression_ratio": 2.73,
+      "cosine_sim_keys": 1.000764,
+      "cosine_sim_values": 0.99958,
+      "max_error": 0.645112,
+      "compress_ms": 647.5,
+      "decompress_ms": 10654.4
+    },
+    {
+      "bit_budget": 8,
+      "compression_ratio": 2.07,
+      "cosine_sim_keys": 1.000771,
+      "cosine_sim_values": 1.000009,
+      "max_error": 0.153867,
+      "compress_ms": 795.0,
+      "decompress_ms": 10783.3
+    }
+  ],
+  "timestamp": "2026-03-31T17:31:09"
+}

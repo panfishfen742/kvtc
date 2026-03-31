@@ -99,3 +99,4 @@ def compute_quant_params(pca_values: torch.Tensor, bit_widths: torch.Tensor) -> 
         zero_points=zero_points,
         mins=mins,
     )
+

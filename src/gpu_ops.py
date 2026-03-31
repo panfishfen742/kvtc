@@ -1,10 +1,10 @@
-"""GPU-optimized KVTC operations — vectorized PyTorch, no Python loops."""
+﻿"""GPU-optimized KVTC operations — vectorized PyTorch, no Python loops."""
 
 from __future__ import annotations
 
 import torch
 
-from .common import QuantizationParams
+from common import QuantizationParams
 
 
 def greedy_bit_allocation(
@@ -31,7 +31,7 @@ def greedy_bit_allocation(
         return torch.zeros(d, dtype=torch.int64)
     
     # gains_matrix[i, b-1] = λᵢ × 3 / 4^b (gain of b-th bit on component i)
-    bit_levels = torch.arange(1, max_bits + 1, dtype=torch.float64)  # [max_bits]
+    bit_levels = torch.arange(1, max_bits + 1, dtype=torch.float64, device=ev.device)  # [max_bits]
     gains_matrix = ev.unsqueeze(1) * 3.0 / (4.0 ** bit_levels.unsqueeze(0))  # [d, max_bits]
     
     flat_gains = gains_matrix.flatten()  # [d * max_bits]
@@ -68,12 +68,15 @@ def vectorized_quant_params(
     d = pca_values.shape[1]
     mins = pca_values.min(dim=0).values.to(torch.float32)
     maxs = pca_values.max(dim=0).values.to(torch.float32)
-    bw = bit_widths.to(torch.float32)
+    bw = bit_widths.to(dtype=torch.float32, device=pca_values.device)
     
     # Compute qmax per component: (1 << bits) - 1, but handle 0-bit
     # For 0-bit components: qmax=1 (avoid div by zero), then zero out later
     nonzero_mask = bw > 0
     safe_bw = torch.where(nonzero_mask, bw, torch.ones_like(bw))
+    # Ensure all tensors on same device
+    mins = mins.to(pca_values.device)
+    maxs = maxs.to(pca_values.device)
     qmax = (2.0 ** safe_bw) - 1.0
     qmax = torch.where(nonzero_mask, qmax, torch.ones_like(qmax))
     
@@ -111,14 +114,14 @@ def batch_quantize(
     Returns:
         indices: [num_rows, components] int64 tensor
     """
-    bw = bit_widths.to(torch.float32)
+    bw = bit_widths.to(dtype=torch.float32, device=pca_values.device)
     nonzero_mask = bw > 0  # [components]
     safe_bw = torch.where(nonzero_mask, bw, torch.ones_like(bw))
     qmax = (2.0 ** safe_bw - 1.0).unsqueeze(0)  # [1, components]
     
     # Quantize: round(value / scale + zero_point), clamp to [0, qmax]
-    s = scales.unsqueeze(0)  # [1, components]
-    zp = zero_points.unsqueeze(0)  # [1, components]
+    s = scales.to(device=pca_values.device).unsqueeze(0)  # [1, components]
+    zp = zero_points.to(device=pca_values.device).unsqueeze(0)  # [1, components]
     
     indices = torch.round(pca_values / s + zp)
     indices = indices.clamp(min=0)
@@ -169,7 +172,7 @@ def fast_pack_bits(
     Uses GPU-accelerated packing if available, falls back to numpy/python.
     """
     try:
-        from .triton_kernels import gpu_pack_variable_width, HAS_TRITON
+        from triton_kernels import gpu_pack_variable_width, HAS_TRITON
         if HAS_TRITON or True:  # gpu_pack uses torch ops, doesn't need triton
             return gpu_pack_variable_width(indices, bit_widths)
     except ImportError:
@@ -251,7 +254,7 @@ def fast_unpack_dequantize(
 ) -> torch.Tensor:
     """Unpack and dequantize — uses GPU-accelerated version with vectorized dequant per column."""
     try:
-        from .triton_kernels import gpu_unpack_dequantize
+        from triton_kernels import gpu_unpack_dequantize
         return gpu_unpack_dequantize(packed_bytes, bit_widths, num_rows, scales, zero_points)
     except ImportError:
         pass
@@ -288,3 +291,4 @@ def fast_unpack_dequantize(
             result[row, comp_idx] = (val - zp) * s
     
     return result
+

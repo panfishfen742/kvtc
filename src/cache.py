@@ -63,3 +63,4 @@ class KVTCCache(DynamicCache):
         """Return the live layer if present."""
 
         return self.live_cache.get(layer_idx)
+

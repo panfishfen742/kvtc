@@ -264,3 +264,4 @@ def gpu_unpack_dequantize(
         result[:, comp_idx] = (vals.float() - zp) * s
     
     return result
+

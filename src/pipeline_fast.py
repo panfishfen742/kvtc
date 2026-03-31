@@ -230,3 +230,4 @@ class KVTCCompressorFast:
 
         self._timing["decompress_ms"] = (time.perf_counter() - t_total) * 1000
         return result
+

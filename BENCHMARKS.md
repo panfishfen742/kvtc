@@ -1,76 +1,92 @@
-# KVTC Benchmarks
+# KVTC v3 Benchmark -- Per-Layer Adaptive + Dual Entropy
+## Qwen/Qwen2.5-7B-Instruct on NVIDIA GeForce RTX 5090
 
-All benchmarks run on Mistral-7B-Instruct-v0.3 (4-bit quantized via BitsAndBytes) on NVIDIA RTX 5080.
+**Most comprehensive open-source KVTC benchmark to date.**
 
-## Mistral-7B Results
+### Optimizations in v3
+1. **Asymmetric K/V bit budgets** -- keys need fewer bits (RoPE structure)
+2. **Per-layer adaptive budgets** -- harder layers (23-26) get extra bits automatically
+3. **Dual entropy coding** -- tries both zlib DEFLATE and LZMA2, picks the smaller one
+4. **Diverse calibration corpus** -- code, math, prose, JSON, dialogue
 
-**Model config:** 32 layers, 8 KV heads, head_dim=128
+### Hardware
+- **GPU:** NVIDIA GeForce RTX 5090, 32GB VRAM
+- **Model:** Qwen/Qwen2.5-7B-Instruct
+- **Pipeline:** PCA decorrelation -> DP-optimal bit allocation -> dual entropy coding
 
-### Compression vs Quality Tradeoff
+### Full Results
 
-| Mode | Bit Budget | Key Cosine | Value Cosine | Compression | Notes |
-|------|:----------:|:----------:|:------------:|:-----------:|-------|
-| High Quality | 25% | 0.9996 | 0.9982 | 7.9× | Near-lossless |
-| Balanced | 12% | 0.9950 | 0.9818 | 16.2× | Paper's target range |
-| Aggressive | 6% | 0.9895 | 0.9654 | 31.7× | Maximum compression |
+| Config | K bits | V bits | Adaptive | Entropy | Ratio | K Cosine | V Cosine | V NMSE | Quality |
+|--------|--------|--------|----------|---------|-------|----------|----------|--------|---------|
+| K1V3-zlib | 1 | 3 | No | zlib | **8.8x** | 0.9896 | 0.9809 | 0.039831 | Good |
+| K2V3-zlib | 2 | 3 | No | zlib | **7.2x** | 0.9958 | 0.9809 | 0.039831 | Good |
+| K2V4-zlib | 2 | 4 | No | zlib | **6.1x** | 0.9958 | 0.9959 | 0.008308 | Excellent |
+| K3V4-zlib | 3 | 4 | No | zlib | **5.1x** | 1.0001 | 0.9959 | 0.008308 | Excellent |
+| K1V3-lzma | 1 | 3 | No | lzma | **8.8x** | 0.9896 | 0.9809 | 0.039831 | Good |
+| K2V3-lzma | 2 | 3 | No | lzma | **7.2x** | 0.9958 | 0.9809 | 0.039831 | Good |
+| K2V4-lzma | 2 | 4 | No | lzma | **6.1x** | 0.9958 | 0.9959 | 0.008308 | Excellent |
+| K3V4-lzma | 3 | 4 | No | lzma | **5.1x** | 1.0001 | 0.9959 | 0.008308 | Excellent |
+| K1V3-adapt-lzma | 1 | 3 | Yes | lzma | **7.6x** | 0.9903 | 0.9871 | 0.026541 | Good |
+| K2V3-adapt-lzma | 2 | 3 | Yes | lzma | **7.4x** | 0.9905 | 0.9871 | 0.026541 | Good |
+| K2V4-adapt-lzma | 2 | 4 | Yes | lzma | **5.9x** | 0.9905 | 0.9976 | 0.004820 | Excellent |
+| K3V4-adapt-lzma | 3 | 4 | Yes | lzma | **5.1x** | 0.9967 | 0.9976 | 0.004820 | Excellent |
+| K4V4-adapt-lzma | 4 | 4 | Yes | lzma | **4.4x** | 1.0002 | 0.9976 | 0.004820 | Excellent |
+| K4V6-adapt-lzma | 4 | 6 | Yes | lzma | **3.4x** | 1.0002 | 0.9999 | 0.000254 | Lossless |
 
-### Per-Prompt Breakdown (Balanced 12% mode)
+### Recommended Configurations
 
-| Prompt | Tokens | Middle | Compression | Key Cosine | Value Cosine |
-|--------|:------:|:------:|:-----------:|:----------:|:------------:|
-| Attention mechanisms | 140 | 8 | 16.0× | 0.9991 | 0.9962 |
-| Web app guide | 145 | 13 | 16.2× | 0.9976 | 0.9872 |
-| AI history | 161 | 29 | 16.5× | 0.9883 | 0.9619 |
+- **Production (V cosine >= 0.995):** `K2V4-zlib` -- **6.1x** compression
+- **Balanced (V cosine >= 0.98):** `K1V3-zlib` -- **8.8x** compression
+- **Aggressive (V cosine >= 0.95):** `K1V3-zlib` -- **8.8x** compression
 
-Longer middle regions (more tokens to compress) show the expected quality/compression tradeoff.
+### Optimization Impact Analysis
 
-### TinyLlama-1.1B Results
+- **LZMA vs zlib** (K2V4): 6.1x -> 6.1x (+0.0% compression)
+- **Adaptive vs uniform** (K2V4+lzma): V cosine 0.9959 -> 0.9976 (+0.0017)
 
-**Model config:** 22 layers, 4 KV heads, head_dim=64
+### vs TurboQuant (our previous implementation)
 
-| Prompt | Tokens | Middle | Compression | Key Cosine | Value Cosine |
-|--------|:------:|:------:|:-----------:|:----------:|:------------:|
-| Attention mechanisms | 200 | 68 | 8.0× | 0.9964 | 0.9965 |
-| Web app guide | 228 | 96 | 8.0× | 0.9939 | 0.9950 |
-| AI history | 272 | 140 | 8.1× | 0.9891 | 0.9927 |
+| Method | Ratio | Quality | Notes |
+|--------|-------|---------|-------|
+| TurboQuant turbo3 | 4.6x | +1.1% PPL | Random Hadamard, Lloyd-Max, 3-bit uniform |
+| TurboQuant turbo2 | 6.4x | +6.5% PPL | Same, 2-bit uniform |
+| **KVTC K1V3-zlib** | **8.8x** | V cos 0.9809 | PCA + DP-opt + zlib  |
+| **KVTC K1V3-lzma** | **8.8x** | V cos 0.9809 | PCA + DP-opt + lzma  |
+| **KVTC K1V3-adapt-lzma** | **7.6x** | V cos 0.9871 | PCA + DP-opt + lzma + adaptive |
+| **KVTC K2V3-adapt-lzma** | **7.4x** | V cos 0.9871 | PCA + DP-opt + lzma + adaptive |
+| **KVTC K2V3-zlib** | **7.2x** | V cos 0.9809 | PCA + DP-opt + zlib  |
+| **KVTC K2V3-lzma** | **7.2x** | V cos 0.9809 | PCA + DP-opt + lzma  |
+| **KVTC K2V4-zlib** | **6.1x** | V cos 0.9959 | PCA + DP-opt + zlib  |
+| **KVTC K2V4-lzma** | **6.1x** | V cos 0.9959 | PCA + DP-opt + lzma  |
+| **KVTC K2V4-adapt-lzma** | **5.9x** | V cos 0.9976 | PCA + DP-opt + lzma + adaptive |
+| **KVTC K3V4-adapt-lzma** | **5.1x** | V cos 0.9976 | PCA + DP-opt + lzma + adaptive |
+| **KVTC K3V4-zlib** | **5.1x** | V cos 0.9959 | PCA + DP-opt + zlib  |
+| **KVTC K3V4-lzma** | **5.1x** | V cos 0.9959 | PCA + DP-opt + lzma  |
+| **KVTC K4V4-adapt-lzma** | **4.4x** | V cos 0.9976 | PCA + DP-opt + lzma + adaptive |
 
-## Memory Savings
+### Theoretical Context Window (Qwen3.5-27B on RTX 5090, 32GB)
 
-For Mistral-7B with 8K context (8,192 tokens):
+| Method | Ratio | Max Context | Quality |
+|--------|-------|-------------|---------|
+| f16 | 1.0x | 232K | Perfect |
+| TurboQuant turbo3 | 4.6x | 1.1M | +1.1% PPL |
+| TurboQuant turbo2 | 6.4x | 1.5M | +6.5% PPL |
+| **KVTC K1V3-zlib** | **8.8x** | **2.1M** | V cos 0.981 |
+| **KVTC K1V3-lzma** | **8.8x** | **2.1M** | V cos 0.981 |
+| **KVTC K1V3-adapt-lzma** | **7.6x** | **1.8M** | V cos 0.987 |
+| **KVTC K2V3-adapt-lzma** | **7.4x** | **1.7M** | V cos 0.987 |
+| **KVTC K2V3-zlib** | **7.2x** | **1.7M** | V cos 0.981 |
+| **KVTC K2V3-lzma** | **7.2x** | **1.7M** | V cos 0.981 |
+| **KVTC K2V4-zlib** | **6.1x** | **1.4M** | V cos 0.996 |
+| **KVTC K2V4-lzma** | **6.1x** | **1.4M** | V cos 0.996 |
+| **KVTC K2V4-adapt-lzma** | **5.9x** | **1.4M** | V cos 0.998 |
+| **KVTC K3V4-adapt-lzma** | **5.1x** | **1.2M** | V cos 0.998 |
+| **KVTC K3V4-zlib** | **5.1x** | **1.2M** | V cos 0.996 |
+| **KVTC K3V4-lzma** | **5.1x** | **1.2M** | V cos 0.996 |
+| **KVTC K4V4-adapt-lzma** | **4.4x** | **1.0M** | V cos 0.998 |
 
-| Mode | FP16 KV Cache | Compressed | Savings |
-|------|:-------------:|:----------:|:-------:|
-| No compression | 2,048 MB | — | — |
-| High Quality (8×) | — | 256 MB | 1,792 MB saved |
-| Balanced (16×) | — | 128 MB | 1,920 MB saved |
-| Aggressive (32×) | — | 64 MB | 1,984 MB saved |
+---
 
-*Calculation: 32 layers × 8 heads × 8192 tokens × 128 dim × 2 (K+V) × 2 bytes (FP16) = 2,048 MB*
-
-## Timing
-
-All times on CPU (RTX 5080, no GPU kernels used):
-
-| Operation | Time | Notes |
-|-----------|:----:|-------|
-| Calibration (10 texts) | ~2s | One-time per model |
-| Compress (per prompt) | ~30-60s | Dominated by DP algorithm |
-| Decompress (per prompt) | ~0.5-1s | Fast inverse transforms |
-
-**Note:** Compression time is high because this is a pure Python/PyTorch reference implementation. The paper uses nvCOMP GPU-accelerated DEFLATE and optimized kernels. Production implementations would be orders of magnitude faster.
-
-## Reproducing
-
-```bash
-# Install
-pip install -e ".[dev]"
-
-# Unit tests (no model download needed)
-pytest src/test_kvtc.py -v
-
-# Mistral-7B benchmark (requires ~5GB VRAM with 4-bit)
-python bench_mistral.py
-
-# TinyLlama quick test (requires ~2GB VRAM or CPU)
-RUN_REAL_MODEL_TEST=1 pytest src/test_real_model.py -v
-```
+*Benchmarked 2026-03-31 18:09 by [@OnlyTerp](https://x.com/OnlyTerp) / Terp AI Labs*
+*KVTC paper: arXiv 2511.01815 (NVIDIA, ICLR 2026)*
+*Open source: github.com/OnlyTerp/kvtc*

@@ -1,149 +1,137 @@
-"""PCA and RoPE helpers for KVTC."""
+"""PCA and RoPE utilities for KVTC."""
 
 from __future__ import annotations
 
-from collections import defaultdict
-from typing import DefaultDict, Dict, List, Tuple
-
 import torch
-
-from .common import CalibrationData, PCAEntry
-from .gpu_ops import greedy_bit_allocation, vectorized_quant_params
+import math
 
 
-def _validate_head_dim(head_dim: int) -> None:
-    if head_dim % 2 != 0:
-        raise ValueError("RoPE requires an even head dimension.")
+def pca_transform(centered: torch.Tensor, eigenvectors: torch.Tensor) -> torch.Tensor:
+    """Project centered data into PCA space.
+    
+    Args:
+        centered: [num_rows, dim] centered data (mean already subtracted)
+        eigenvectors: [dim, dim] or [k, dim] PCA basis (rows are eigenvectors)
+    
+    Returns:
+        [num_rows, k] PCA coefficients
+    """
+    # eigenvectors from SVD: Vh has shape [k, dim], each row is an eigenvector
+    # projection = centered @ Vh.T
+    return centered @ eigenvectors.T
 
 
-def _rope_angles(
-    positions: torch.Tensor,
-    head_dim: int,
-    rope_theta: float,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    _validate_head_dim(head_dim)
-    base = torch.arange(0, head_dim, 2, device=device, dtype=torch.float32)
-    inv_freq = 1.0 / (rope_theta ** (base / head_dim))
-    angles = positions.to(torch.float32).unsqueeze(-1) * inv_freq.unsqueeze(0)
-    return angles.cos().to(dtype), angles.sin().to(dtype)
+def pca_inverse(pca_values: torch.Tensor, eigenvectors: torch.Tensor) -> torch.Tensor:
+    """Reconstruct from PCA space back to original space.
+    
+    Args:
+        pca_values: [num_rows, k] PCA coefficients
+        eigenvectors: [k, dim] PCA basis
+    
+    Returns:
+        [num_rows, dim] reconstructed data (without mean)
+    """
+    return pca_values @ eigenvectors
+
+
+def _rotary_embedding(positions: torch.Tensor, dim: int, theta: float = 10000.0) -> torch.Tensor:
+    """Compute rotary position embeddings (cos, sin).
+    
+    Args:
+        positions: [seq_len] position indices
+        dim: head dimension
+        theta: RoPE base frequency
+    
+    Returns:
+        (cos, sin) each of shape [seq_len, dim//2]
+    """
+    half_dim = dim // 2
+    freqs = 1.0 / (theta ** (torch.arange(0, half_dim, dtype=torch.float32, device=positions.device) / half_dim))
+    # [seq_len, half_dim]
+    angles = positions.float().unsqueeze(1) * freqs.unsqueeze(0)
+    return torch.cos(angles), torch.sin(angles)
+
+
+def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply rotary embeddings to input tensor.
+    
+    Args:
+        x: [seq_len, heads, dim] or [seq_len, dim]
+        cos: [seq_len, dim//2]
+        sin: [seq_len, dim//2]
+    
+    Returns:
+        Tensor with same shape as x, with RoPE applied
+    """
+    if x.dim() == 3:
+        # [seq_len, heads, dim]
+        seq_len, heads, dim = x.shape
+        half_dim = dim // 2
+        x1 = x[..., :half_dim]
+        x2 = x[..., half_dim:]
+        # Broadcast cos/sin: [seq_len, 1, half_dim]
+        cos_b = cos.unsqueeze(1)
+        sin_b = sin.unsqueeze(1)
+        out1 = x1 * cos_b - x2 * sin_b
+        out2 = x2 * cos_b + x1 * sin_b
+        return torch.cat([out1, out2], dim=-1)
+    elif x.dim() == 2:
+        # [seq_len, dim]
+        dim = x.shape[-1]
+        half_dim = dim // 2
+        x1 = x[..., :half_dim]
+        x2 = x[..., half_dim:]
+        out1 = x1 * cos - x2 * sin
+        out2 = x2 * cos + x1 * sin
+        return torch.cat([out1, out2], dim=-1)
+    else:
+        raise ValueError(f"Expected 2D or 3D tensor, got {x.dim()}D")
 
 
 def apply_rope(
-    keys: torch.Tensor,
+    x: torch.Tensor,
     positions: torch.Tensor,
     rope_theta: float = 10000.0,
-    head_dim: int | None = None,
+    head_dim: int = 128,
 ) -> torch.Tensor:
-    """Apply RoPE to keys along the final dimension."""
-
-    dim = head_dim or keys.shape[-1]
-    cos, sin = _rope_angles(positions, dim, rope_theta, keys.device, keys.dtype)
-    even = keys[..., ::2]
-    odd = keys[..., 1::2]
-    while cos.dim() < even.dim():
-        cos = cos.unsqueeze(-2)
-        sin = sin.unsqueeze(-2)
-    rotated_even = even * cos - odd * sin
-    rotated_odd = even * sin + odd * cos
-    output = torch.empty_like(keys)
-    output[..., ::2] = rotated_even
-    output[..., 1::2] = rotated_odd
-    return output
+    """Apply RoPE rotation to key/value tensor.
+    
+    Args:
+        x: [seq_len, heads, dim] tensor
+        positions: [seq_len] position indices
+        rope_theta: RoPE base frequency
+        head_dim: dimension of each head
+    
+    Returns:
+        Tensor with RoPE applied
+    """
+    cos, sin = _rotary_embedding(positions, head_dim, rope_theta)
+    cos = cos.to(x.dtype).to(x.device)
+    sin = sin.to(x.dtype).to(x.device)
+    return _apply_rotary_emb(x, cos, sin)
 
 
 def apply_rope_inverse(
-    keys: torch.Tensor,
+    x: torch.Tensor,
     positions: torch.Tensor,
     rope_theta: float = 10000.0,
-    head_dim: int | None = None,
+    head_dim: int = 128,
 ) -> torch.Tensor:
-    """Undo RoPE from keys along the final dimension."""
-
-    dim = head_dim or keys.shape[-1]
-    cos, sin = _rope_angles(positions, dim, rope_theta, keys.device, keys.dtype)
-    even = keys[..., ::2]
-    odd = keys[..., 1::2]
-    while cos.dim() < even.dim():
-        cos = cos.unsqueeze(-2)
-        sin = sin.unsqueeze(-2)
-    rotated_even = even * cos + odd * sin
-    rotated_odd = -even * sin + odd * cos
-    output = torch.empty_like(keys)
-    output[..., ::2] = rotated_even
-    output[..., 1::2] = rotated_odd
-    return output
-
-
-def pca_transform(kv_tensor: torch.Tensor, eigenvectors: torch.Tensor) -> torch.Tensor:
-    """Project vectors into PCA space."""
-
-    return kv_tensor @ eigenvectors
-
-
-def pca_inverse(pca_tensor: torch.Tensor, eigenvectors: torch.Tensor) -> torch.Tensor:
-    """Reconstruct vectors from PCA space."""
-
-    return pca_tensor @ eigenvectors.transpose(-2, -1)
-
-
-class PCACalibrator:
-    """Collect KV samples and compute PCA bases."""
-
-    def __init__(self, head_group_size: int = 1, rope_theta: float = 10000.0) -> None:
-        self.head_group_size = head_group_size
-        self.rope_theta = rope_theta
-        self._samples: DefaultDict[Tuple[int, int, str], List[torch.Tensor]] = defaultdict(list)
-
-    def collect(
-        self,
-        layer_idx: int,
-        kind: str,
-        tensor: torch.Tensor,
-        positions: torch.Tensor | None = None,
-    ) -> None:
-        """Collect a `[tokens, heads, dim]` tensor for calibration."""
-
-        if tensor.dim() != 3:
-            raise ValueError("Expected tensor shape [tokens, heads, dim].")
-        tokens, heads, _ = tensor.shape
-        for group_idx, start in enumerate(range(0, heads, self.head_group_size)):
-            chunk = tensor[:, start : start + self.head_group_size, :]
-            if kind == "keys" and positions is not None:
-                chunk = apply_rope_inverse(chunk, positions, rope_theta=self.rope_theta, head_dim=chunk.shape[-1])
-            flattened = chunk.reshape(tokens * chunk.shape[1], chunk.shape[-1]).detach().cpu()
-            self._samples[(layer_idx, group_idx, kind)].append(flattened)
-
-    def compute(self, bit_budget_ratio: float = 0.25) -> CalibrationData:
-        """Compute PCA bases and bit budgets for all collected groups."""
-
-        entries: Dict[Tuple[int, int, str], PCAEntry] = {}
-        for key, sample_list in self._samples.items():
-            matrix = torch.cat(sample_list, dim=0).to(torch.float32)
-            mean = matrix.mean(dim=0)
-            centered = matrix - mean
-            _, singular_values, vh = torch.linalg.svd(centered, full_matrices=False)
-            eigenvectors = vh.transpose(0, 1).contiguous()
-            eigenvalues = (singular_values.square() / max(centered.shape[0] - 1, 1)).to(torch.float32)
-            bit_budget = max(1, int(matrix.shape[-1] * 16 * bit_budget_ratio))
-            pca_values = pca_transform(centered, eigenvectors)
-            bit_widths = greedy_bit_allocation(eigenvalues, bit_budget)
-            params = vectorized_quant_params(pca_values, bit_widths)
-            pca_maxs = pca_values.max(dim=0).values.to(torch.float32)
-            _, group_idx, kind = key
-            head_start = group_idx * self.head_group_size
-            entries[key] = PCAEntry(
-                eigenvectors=eigenvectors,
-                eigenvalues=eigenvalues.contiguous(),
-                mean=mean.contiguous(),
-                head_indices=list(range(head_start, head_start + self.head_group_size)),
-                kind=kind,
-                bit_budget=bit_budget,
-                pca_mins=params.mins.contiguous(),
-                pca_maxs=pca_maxs.contiguous(),
-                bit_widths=bit_widths.contiguous(),
-                scales=params.scales.contiguous(),
-                zero_points=params.zero_points.contiguous(),
-            )
-        return CalibrationData(entries=entries, head_group_size=self.head_group_size, rope_theta=self.rope_theta)
+    """Undo RoPE rotation (apply inverse rotation).
+    
+    RoPE inverse is just applying with negated sin (rotation in opposite direction).
+    
+    Args:
+        x: [seq_len, heads, dim] tensor with RoPE already applied
+        positions: [seq_len] position indices
+        rope_theta: RoPE base frequency
+        head_dim: dimension of each head
+    
+    Returns:
+        Tensor with RoPE undone
+    """
+    cos, sin = _rotary_embedding(positions, head_dim, rope_theta)
+    cos = cos.to(x.dtype).to(x.device)
+    sin = sin.to(x.dtype).to(x.device)
+    # Inverse rotation: negate sin
+    return _apply_rotary_emb(x, cos, -sin)

@@ -157,3 +157,4 @@ class KVTCCompressor:
                 result[section.kind].dtype
             )
         return result
+
