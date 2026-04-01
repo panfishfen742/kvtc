@@ -10,8 +10,13 @@ FA can treat it identically to q8_0.
 
 import os
 import re
+import argparse
 
-CUDA_DIR = r"T:\ik-llama\llama-cpp-turboquant\ggml\src\ggml-cuda"
+parser = argparse.ArgumentParser(description="Patch Flash Attention for KVTC")
+parser.add_argument("--src", type=str, default=os.getcwd(),
+                    help="Path to llama-cpp-turboquant source (default: current directory)")
+_args, _ = parser.parse_known_args()
+CUDA_DIR = os.path.join(_args.src, "ggml", "src", "ggml-cuda")
 
 def patch_file(filepath, description):
     """Add KVTC alongside Q8_0 in type switches."""

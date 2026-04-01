@@ -1,18 +1,20 @@
 @echo off
 setlocal
 set PYTHONIOENCODING=utf-8
-set PYTHON=C:\Users\User\AppData\Local\Programs\Python\Python311\python.exe
+
+REM Use python from PATH, or set PYTHON env var to override
+if "%PYTHON%"=="" set PYTHON=python
 
 echo ============================================
 echo KVTC 5090 GPU Benchmark
 echo ============================================
 
-cd /d C:\Users\User
-if not exist kvtc (
-    git clone https://github.com/OnlyTerp/kvtc.git
+%PYTHON% --version 2>nul
+if errorlevel 1 (
+    echo ERROR: Python not found. Set PYTHON env var or add python to PATH.
+    pause
+    exit /b 1
 )
-cd kvtc
-git pull
 
 %PYTHON% -m pip install -e . --quiet 2>nul
 
@@ -36,5 +38,5 @@ echo.
 echo ============================================
 echo ALL BENCHMARKS COMPLETE
 echo ============================================
-echo Copy everything above and send to Terp AI Labs
+echo ALL BENCHMARKS COMPLETE
 pause

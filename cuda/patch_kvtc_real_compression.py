@@ -9,8 +9,13 @@ can read KVTC blocks using turbo2's vec_dot kernels.
 
 import os
 import sys
+import argparse
 
-SRC = r"T:\ik-llama\llama-cpp-turboquant"
+parser = argparse.ArgumentParser(description="Wire KVTC to turbo2 compression")
+parser.add_argument("--src", type=str, default=os.getcwd(),
+                    help="Path to llama-cpp-turboquant source (default: current directory)")
+_args, _ = parser.parse_known_args()
+SRC = _args.src
 
 def patch(filepath, old, new, desc):
     content = open(filepath, "r").read()

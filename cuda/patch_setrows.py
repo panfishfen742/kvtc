@@ -1,7 +1,13 @@
 """Patch set-rows.cu to add KVTC support."""
 import sys
+import os
+import argparse
 
-f = r"T:\ik-llama\llama-cpp-turboquant\ggml\src\ggml-cuda\set-rows.cu"
+parser = argparse.ArgumentParser(description="Patch set-rows.cu for KVTC")
+parser.add_argument("--src", type=str, default=os.getcwd(),
+                    help="Path to llama-cpp-turboquant source (default: current directory)")
+_args, _ = parser.parse_known_args()
+f = os.path.join(_args.src, "ggml", "src", "ggml-cuda", "set-rows.cu")
 content = open(f, "r").read()
 
 target = 'GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));'

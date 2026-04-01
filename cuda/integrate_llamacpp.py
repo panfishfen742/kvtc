@@ -4,18 +4,23 @@ Adds GGML_TYPE_KVTC as a stub KV cache type in the TurboQuant fork.
 Phase 1: Stub that uses q8_0 internally (proves the plumbing works).
 Phase 2: Wire in actual KVTC CUDA kernels.
 
-Run on the 5090:
-    cd T:\ik-llama\llama-cpp-turboquant
-    py T:\kvtc-bench\integrate_kvtc_llamacpp.py
+Usage:
+    cd /path/to/llama-cpp-turboquant
+    python /path/to/kvtc/cuda/integrate_llamacpp.py [--src /path/to/llama-cpp-turboquant]
 """
 
 import os
 import sys
 import re
 import shutil
+import argparse
 from pathlib import Path
 
-SRC = Path(r"T:\ik-llama\llama-cpp-turboquant")
+parser = argparse.ArgumentParser(description="KVTC llama.cpp integration")
+parser.add_argument("--src", type=str, default=os.getcwd(),
+                    help="Path to llama-cpp-turboquant source (default: current directory)")
+args, _ = parser.parse_known_args()
+SRC = Path(args.src)
 
 def backup_file(path):
     bak = str(path) + ".kvtc-bak"
@@ -154,7 +159,7 @@ def main():
     print("This means -ctk kvtc -ctv kvtc will work but gives q8_0 compression.")
     print("Phase 2 will replace q8_0 stubs with actual KVTC PCA+quant kernels.")
     print("\nTo build:")
-    print("  cd T:\\ik-llama\\llama-cpp-turboquant\\build")
+    print(f"  cd {SRC / 'build'}")
     print("  cmake --build . --config Release")
     print("\nTo test:")
     print("  llama-server.exe -m model.gguf -ctk kvtc -ctv kvtc -fa on -ngl 99 -c 32768")

@@ -4,9 +4,9 @@ echo "=== KVTC vLLM Proof Benchmark (WSL2) ==="
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'unknown')"
 
 # Setup
-export HF_HOME=/mnt/t/huggingface
 export PYTHONIOENCODING=utf-8
-cd /mnt/c/Users/User/kvtc
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
 # Install deps
 echo "[1/3] Installing dependencies..."

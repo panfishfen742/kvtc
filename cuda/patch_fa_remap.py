@@ -6,8 +6,13 @@ all existing Q8_0 template instantiations work automatically.
 """
 
 import os
+import argparse
 
-FATTN = r"T:\ik-llama\llama-cpp-turboquant\ggml\src\ggml-cuda\fattn.cu"
+parser = argparse.ArgumentParser(description="Patch FA remap for KVTC")
+parser.add_argument("--src", type=str, default=os.getcwd(),
+                    help="Path to llama-cpp-turboquant source (default: current directory)")
+_args, _ = parser.parse_known_args()
+FATTN = os.path.join(_args.src, "ggml", "src", "ggml-cuda", "fattn.cu")
 
 content = open(FATTN, "r").read()
 
